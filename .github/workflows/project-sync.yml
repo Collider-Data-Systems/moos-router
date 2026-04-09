@@ -1,0 +1,25 @@
+name: Project Sync
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, closed]
+  issues:
+    types: [opened, reopened, closed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  repository-projects: write
+
+jobs:
+  sync:
+    uses: MSD21091969/moos-config/.github/workflows/project-sync-reusable.yml@master
+    with:
+      event_name: ${{ github.event_name }}
+      action: ${{ github.event.action }}
+      content_node_id: ${{ github.event.pull_request.node_id || github.event.issue.node_id }}
+      is_pr: ${{ github.event_name == 'pull_request' }}
+      is_merged: ${{ github.event.pull_request.merged || false }}
+    permissions:
+      repository-projects: write
