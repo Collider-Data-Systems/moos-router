@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"moos/router/internal/proxy"
 )
@@ -28,6 +29,7 @@ func (s *shardFlags) Set(value string) error {
 func main() {
 	listenAddr := flag.String("listen", ":9000", "router listen address")
 	defaultKernel := flag.String("default", "", "fallback kernel URL when no prefix matches")
+	healthTimeout := flag.Duration("health-timeout", 2*time.Second, "timeout for per-kernel health checks")
 	var shardValues shardFlags
 	flag.Var(&shardValues, "shard", "shard rule in format urn_prefix=http://host:port")
 	flag.Parse()
@@ -61,6 +63,7 @@ func main() {
 	}
 
 	router := proxy.NewRouter(rules)
+	router.HealthTimeout = *healthTimeout
 	log.Printf("router: listening on %s, shards: %d", *listenAddr, len(rules))
 	if err := http.ListenAndServe(*listenAddr, router); err != nil {
 		log.Fatalf("router: %v", err)

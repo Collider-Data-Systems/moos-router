@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestRoute_LongestPrefixMatch(t *testing.T) {
@@ -167,6 +168,77 @@ func TestServeHTTP_FanOut_StateNodes(t *testing.T) {
 	}
 }
 
+func TestServeHTTP_FanOut_StateNodesPartialSuccess(t *testing.T) {
+	kernelA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"urn":"A"}]`))
+	}))
+	defer kernelA.Close()
+
+	kernelB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "downstream unavailable"})
+	}))
+	defer kernelB.Close()
+
+	router := NewRouter([]ShardRule{
+		{URNPrefix: "urn:moos:ws:hp-laptop", TargetURL: kernelA.URL, Priority: 0},
+		{URNPrefix: "urn:moos:ws:hp-z440", TargetURL: kernelB.URL, Priority: 0},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/state/nodes", nil)
+	rr := httptest.NewRecorder()
+
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+
+	var nodes []struct {
+		URN string `json:"urn"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&nodes); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].URN != "A" {
+		t.Fatalf("nodes = %+v, want only surviving kernel payload", nodes)
+	}
+}
+
+func TestServeHTTP_FanOut_AllFailures(t *testing.T) {
+	kernelA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "downstream unavailable"})
+	}))
+	defer kernelA.Close()
+
+	kernelB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "offline"})
+	}))
+	defer kernelB.Close()
+
+	router := NewRouter([]ShardRule{
+		{URNPrefix: "urn:moos:ws:hp-laptop", TargetURL: kernelA.URL, Priority: 0},
+		{URNPrefix: "urn:moos:ws:hp-z440", TargetURL: kernelB.URL, Priority: 0},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/state/nodes", nil)
+	rr := httptest.NewRecorder()
+
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusBadGateway)
+	}
+
+	var payload map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&payload); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if !strings.Contains(payload["error"], "fan-out failed for all kernels") {
+		t.Fatalf("error = %q, want all-kernels failure message", payload["error"])
+	}
+}
+
 func TestServeHTTP_Healthz(t *testing.T) {
 	var mu sync.Mutex
 	paths := map[string]string{}
@@ -235,5 +307,46 @@ func TestServeHTTP_Healthz(t *testing.T) {
 	defer mu.Unlock()
 	if paths["A"] != "/healthz" || paths["B"] != "/healthz" {
 		t.Fatalf("health paths = %+v, want both requests on /healthz", paths)
+	}
+}
+
+func TestServeHTTP_Healthz_UsesConfiguredTimeout(t *testing.T) {
+	kernel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","log_len":5}`))
+	}))
+	defer kernel.Close()
+
+	router := NewRouter([]ShardRule{{URNPrefix: "urn:moos:ws:hp-laptop", TargetURL: kernel.URL, Priority: 0}})
+	router.HealthTimeout = 5 * time.Millisecond
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rr := httptest.NewRecorder()
+
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+
+	var response struct {
+		Kernels []struct {
+			Status string `json:"status"`
+			Error  string `json:"error"`
+		} `json:"kernels"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&response); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+
+	if len(response.Kernels) != 1 {
+		t.Fatalf("kernels length = %d, want 1", len(response.Kernels))
+	}
+	if response.Kernels[0].Status != "down" {
+		t.Fatalf("kernel status = %q, want down", response.Kernels[0].Status)
+	}
+	if response.Kernels[0].Error == "" {
+		t.Fatalf("kernel error = empty, want timeout error")
 	}
 }

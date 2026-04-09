@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"time"
 )
+
+const defaultHealthTimeout = 2 * time.Second
 
 // ShardRule maps a URN prefix to a target kernel base URL.
 type ShardRule struct {
@@ -23,9 +26,10 @@ type ShardRule struct {
 
 // Router holds the shard table and routes requests.
 type Router struct {
-	Rules   []ShardRule
-	kernels []string
-	client  *http.Client
+	Rules         []ShardRule
+	kernels       []string
+	client        *http.Client
+	HealthTimeout time.Duration
 }
 
 // NewRouter creates a Router from a list of rules.
@@ -51,9 +55,10 @@ func NewRouter(rules []ShardRule) *Router {
 	})
 
 	return &Router{
-		Rules:   copied,
-		kernels: uniqueKernelURLs(copied),
-		client:  &http.Client{},
+		Rules:         copied,
+		kernels:       uniqueKernelURLs(copied),
+		client:        &http.Client{},
+		HealthTimeout: defaultHealthTimeout,
 	}
 }
 
@@ -157,7 +162,10 @@ func (r *Router) forwardSingle(w http.ResponseWriter, req *http.Request, targetB
 
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	written, err := io.Copy(w, resp.Body)
+	if err != nil {
+		log.Printf("proxy: copy response body from %s after %d bytes: %v", targetURL, written, err)
+	}
 }
 
 func (r *Router) handleFanout(w http.ResponseWriter, req *http.Request) {
@@ -222,19 +230,26 @@ func (r *Router) handleFanout(w http.ResponseWriter, req *http.Request) {
 	close(results)
 
 	merged := make([]any, 0)
+	failures := make([]string, 0)
+	successes := 0
 	for result := range results {
 		if result.err != nil {
-			writeError(w, http.StatusBadGateway, fmt.Sprintf("fan-out error for %s: %v", result.url, result.err))
-			return
+			log.Printf("proxy: fan-out skipped %s: %v", result.url, result.err)
+			failures = append(failures, fmt.Sprintf("%s: %v", result.url, result.err))
+			continue
 		}
+
+		successes++
 		if len(result.body) == 0 {
 			continue
 		}
 
 		var decoded any
 		if err := json.Unmarshal(result.body, &decoded); err != nil {
-			writeError(w, http.StatusBadGateway, fmt.Sprintf("invalid JSON from %s: %v", result.url, err))
-			return
+			successes--
+			log.Printf("proxy: fan-out skipped %s: invalid JSON: %v", result.url, err)
+			failures = append(failures, fmt.Sprintf("%s: invalid JSON: %v", result.url, err))
+			continue
 		}
 
 		switch payload := decoded.(type) {
@@ -243,6 +258,15 @@ func (r *Router) handleFanout(w http.ResponseWriter, req *http.Request) {
 		default:
 			merged = append(merged, payload)
 		}
+	}
+
+	if successes == 0 {
+		msg := "fan-out failed for all kernels"
+		if len(failures) > 0 {
+			msg += ": " + strings.Join(failures, "; ")
+		}
+		writeError(w, http.StatusBadGateway, msg)
+		return
 	}
 
 	writeJSON(w, http.StatusOK, merged)
@@ -271,7 +295,7 @@ func (r *Router) handleHealthz(w http.ResponseWriter, req *http.Request) {
 			defer wg.Done()
 
 			entry := kernelStatus{URL: kernelURL, Status: "down"}
-			ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
+			ctx, cancel := context.WithTimeout(req.Context(), r.healthTimeout())
 			defer cancel()
 
 			hReq, err := http.NewRequestWithContext(ctx, http.MethodGet, joinURL(kernelURL, "/healthz", ""), nil)
@@ -317,6 +341,13 @@ func (r *Router) handleHealthz(w http.ResponseWriter, req *http.Request) {
 		"status":  "ok",
 		"kernels": kernels,
 	})
+}
+
+func (r *Router) healthTimeout() time.Duration {
+	if r == nil || r.HealthTimeout <= 0 {
+		return defaultHealthTimeout
+	}
+	return r.HealthTimeout
 }
 
 func extractURNFromBody(body []byte) (string, error) {
@@ -396,7 +427,9 @@ func copyHeaders(dst, src http.Header) {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("proxy: encode response: %v", err)
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
