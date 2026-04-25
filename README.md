@@ -4,10 +4,12 @@ WF16 federation gateway for [mo:os](https://github.com/Collider-Data-Systems/moo
 
 ## What it is
 
-The router sits between MCP / HTTP clients and a federation of mo:os kernels, each with its own sovereign log. It inspects an envelope's URN-shaped fields, matches the prefix against a shard map, and forwards the envelope (or a query) to the right kernel without merging logs.
+The router sits between clients and a federation of mo:os kernels, each with its own sovereign log. It inspects an envelope's URN-shaped fields, matches the prefix against a shard map, and forwards the envelope (or a query) to the right kernel without merging logs.
+
+Clients can reach the router over plain HTTP or via the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP, the JSON-RPC 2.0 protocol Anthropic Claude Desktop and similar tools speak).
 
 ```
-MCP / HTTP clients
+HTTP / MCP clients
         |
         v
    moos-router       (WF16 — URN-prefix shard routing)
@@ -19,29 +21,30 @@ MCP / HTTP clients
 
 Routing is **read-mostly transparent** for state queries (`GET /state/...`) — the router proxies to whichever kernel owns the URN's prefix. Writes (`POST /programs`, `POST /rewrites`) require the client to address the correct kernel directly; the router does not re-route writes (atomic batch semantics rely on a single log's serializability).
 
-WF16 is one of the 21 rewrite categories in the ontology (`ffs0/kb/superset/ontology.json` — private workspace). The router materializes WF16 routing rules from `shard_rule` nodes resolved at startup against a connected kernel's state.
+WF16 is one of the rewrite categories in the mo:os ontology — a strata-aware type system loaded by each kernel at boot. The router materializes routing rules from `shard_rule` nodes resolved at startup against a connected kernel's state. The ontology is published with the kernel; consult [moos-kernel](https://github.com/Collider-Data-Systems/moos-kernel) for the canonical type list.
 
 ## Running
 
 ```bash
-go run ./cmd/moos-router \
-  --shard-config shards.json \
-  --listen :9000
+go run ./cmd/router \
+  --listen :9000 \
+  --shard urn:moos:kernel:host-a.primary=http://kernel-a.example.com:8000 \
+  --shard urn:moos:kernel:host-a.shard1=http://kernel-a.example.com:8001 \
+  --shard urn:moos:kernel:host-b.primary=https://kernel-b.example.com \
+  --default http://kernel-a.example.com:8000 \
+  --peer https://router.partner-org.example.com
 ```
 
-Shard config example:
+### CLI Flags
 
-```json
-{
-  "shards": [
-    {"prefix": "urn:moos:kernel:hp-z440.primary", "kernel_endpoint": "http://localhost:8000"},
-    {"prefix": "urn:moos:kernel:hp-z440.lola",    "kernel_endpoint": "http://localhost:8001"},
-    {"prefix": "urn:moos:kernel:hp-z440.menno",   "kernel_endpoint": "http://localhost:8002"},
-    {"prefix": "urn:moos:kernel:hp-z440.moos",    "kernel_endpoint": "http://localhost:8003"},
-    {"prefix": "urn:moos:kernel:hp-laptop.primary", "kernel_endpoint": "https://api.my-tiny-data-collider.nl"}
-  ]
-}
-```
+| Flag | Purpose |
+|---|---|
+| `--listen` | HTTP listen address (e.g. `:9000`) |
+| `--shard` | Repeatable: `<urn-prefix>=<kernel-url>`. Routes by URN prefix match. |
+| `--default` | Fallback kernel URL for URNs matching no shard |
+| `--peer` | Repeatable: peer router URL for WF16 cross-workstation cascade |
+
+The endpoints above are placeholders — substitute your own kernel hostnames and ports.
 
 ## Testing
 
@@ -49,18 +52,23 @@ Shard config example:
 go test ./...
 ```
 
+Tests focus on proxy routing logic. Kernel-side gates (§M11 session-liveness, §M12 admin-capability, operad validation, fold) are each kernel's responsibility — the router passes them through.
+
+## Stateless contract
+
+The router is **stateless**. It does NOT log envelope bodies, validate operads, or enforce gates. Log-is-truth stays at each `moos-kernel` instance. This binary is a thin read-fanout + write-proxy.
+
 ## Companion repositories
 
-- **moos-kernel** — the rewriting kernel itself
-- **ffs0** — private workspace + doctrine notes + ontology
+- [moos-kernel](https://github.com/Collider-Data-Systems/moos-kernel) — the rewriting kernel itself
 
 ## Status
 
-Active. Used in the Z440 5-kernel + hp-laptop 1-kernel federation. Cloudflare tunnel between machines pending; intra-host routing on `:8000–:8003` plus router on `:9000` is daily-driven.
+Active. Used in multi-kernel federations where each kernel keeps its own sovereign log and the router cascades cross-shard reads.
 
 ## License
 
-(TBD — assignment in progress)
+Copyright © Collider-Data-Systems. All rights reserved. A formal open-source license will be applied in a future release; until then, redistribution rights are not granted by default. Contact the organization for current terms.
 
 ## Contact
 
