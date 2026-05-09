@@ -65,6 +65,8 @@ Tests cover longest-prefix routing, priority tie-breaks, routed writes, fan-out,
 
 Application domains such as `my-tiny-data-collider` should be modeled in HG as groups, purposes, programs, channels, and external surfaces. Those applications may use the router to reach kernels, but their website/DNS/server code should remain separate from this router.
 
+As the T189/T200 projection lane matures, the router's job stays deliberately narrow: route graph traffic by URN/type/topology while Calendar, GitHub Projects, dashboards, websites, DNS, and Workspace remain application or projection surfaces above the kernel/router substrate.
+
 ## Companion Repositories
 
 - `moos-kernel` — log/fold/operad/session runtime.
