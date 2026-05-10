@@ -26,9 +26,9 @@ Example with explicit shards and a type route:
 go run ./cmd/router `
   --listen :9000 `
   --shard urn:moos:kernel:hp-laptop=http://localhost:8000 `
-  --shard urn:moos:kernel:hp-z440=http://192.168.1.13:8000 `
+  --shard urn:moos:kernel:hp-z440=http://192.168.1.11:8000 `
   --type-map session=http://localhost:8000 `
-  --peer http://192.168.1.13:9000
+  --peer http://192.168.1.11:9000
 ```
 
 Flags:
