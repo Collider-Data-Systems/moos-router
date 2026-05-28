@@ -169,7 +169,9 @@ func (r *Router) handleRoutedNodeRequest(w http.ResponseWriter, req *http.Reques
 
 func (r *Router) tryForward(req *http.Request, targetBaseURL string) (*http.Response, []byte, error) {
 	targetURL := joinURL(targetBaseURL, req.URL.Path, req.URL.RawQuery)
-	proxyReq, err := http.NewRequestWithContext(req.Context(), req.Method, targetURL, nil)
+	ctx, cancel := context.WithTimeout(req.Context(), 5*time.Second)
+	defer cancel()
+	proxyReq, err := http.NewRequestWithContext(ctx, req.Method, targetURL, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -240,7 +242,9 @@ func (r *Router) handleFanout(w http.ResponseWriter, req *http.Request) {
 			defer wg.Done()
 
 			targetURL := joinURL(kernelURL, req.URL.Path, req.URL.RawQuery)
-			subReq, err := http.NewRequestWithContext(req.Context(), req.Method, targetURL, bytes.NewReader(body))
+			subCtx, cancel := context.WithTimeout(req.Context(), 5*time.Second)
+			defer cancel()
+			subReq, err := http.NewRequestWithContext(subCtx, req.Method, targetURL, bytes.NewReader(body))
 			if err != nil {
 				results <- fanoutResult{url: kernelURL, err: fmt.Errorf("create request: %w", err)}
 				return
