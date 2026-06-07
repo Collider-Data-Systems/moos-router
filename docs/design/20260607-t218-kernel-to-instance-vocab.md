@@ -12,7 +12,7 @@
 
 `moos-router` is WF16 federation routing: it fans requests out to peer instances and fans state back in.
 The `kernel → instance` rename (D6) therefore touches the router's peer vocabulary even though the router
-holds no log of its own. Per T218 this runtime work lands on `feat/<purpose-slug>` and merges only when
+holds no log of its own. Per T=218 this runtime work lands on `feat/<purpose-slug>` and merges only when
 the build gate passes. This lane keeps the router rename aligned with the kernel rename under one shared
 purpose-slug so the manifold can glue both runtime repos plus the `ffs0` design lane.
 
@@ -29,9 +29,10 @@ purpose-slug so the manifold can glue both runtime repos plus the `ffs0` design 
 - **Alias-first + backward-compatible fanout.** The router must accept and emit both `kernel` and
   `instance` peer labels across the transition so a mixed fleet (some instances renamed, some not) keeps
   federating. Health/state JSON keys change only behind a compatibility window.
-- **Build gate = apply gate (T218).** No rename merges to `master` until `Doctor` + `go test ./...` (plus
+- **Build gate = apply gate (T=218).** No rename merges to `master` until the Doctor check (the ffs0
+  `dev/scripts/ops/Test-MoosFederation.ps1 -Mode Doctor` federation health gate) + `go test ./...` (plus
   a live fan-out/fan-in smoke against at least one peer) pass on this branch.
-- **Boundary.** This branch carries data (this note). Its existence emits no HG rewrite, no deploy, no
-  rename, and changes no DNS/Cloudflare/tunnel surface. It is S0 substrate until reviewed and merged with
-  a provenance trailer:
+- **Boundary.** This branch carries data (this note). Its existence emits no hypergraph (HG) rewrite, no
+  deploy, no rename, and changes no DNS/Cloudflare/tunnel surface. It is S0 substrate until reviewed and
+  merged with a provenance trailer:
   `authored-by: agent:vscode.hp-z440.primary / session:sam.z440-vscode-projection-lead / manifold-instances-vocab`.
