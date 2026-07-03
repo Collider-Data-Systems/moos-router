@@ -350,3 +350,107 @@ func TestServeHTTP_Healthz_UsesConfiguredTimeout(t *testing.T) {
 		t.Fatalf("kernel error = empty, want timeout error")
 	}
 }
+
+func TestRouteByType_Match(t *testing.T) {
+	router := NewRouter(nil, TypeRule{TypeID: "prg_task", TargetURL: "http://z440"})
+
+	got := router.RouteByType("prg_task")
+	if got != "http://z440" {
+		t.Fatalf("RouteByType() = %q, want %q", got, "http://z440")
+	}
+}
+
+func TestRouteByType_NoMatch(t *testing.T) {
+	router := NewRouter(nil, TypeRule{TypeID: "prg_task", TargetURL: "http://z440"})
+
+	got := router.RouteByType("session")
+	if got != "" {
+		t.Fatalf("RouteByType() = %q, want empty", got)
+	}
+}
+
+func TestServeHTTP_TypeRouting_TakesPrecedence(t *testing.T) {
+	// type-map kernel (receives the request)
+	var typeHits int
+	var mu sync.Mutex
+	typeKernel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		typeHits++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"routed":"by-type"}`))
+	}))
+	defer typeKernel.Close()
+
+	// shard kernel (should NOT receive the request)
+	var shardHits int
+	shardKernel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		shardHits++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"routed":"by-shard"}`))
+	}))
+	defer shardKernel.Close()
+
+	router := NewRouter(
+		[]ShardRule{{URNPrefix: "urn:moos:", TargetURL: shardKernel.URL}},
+		TypeRule{TypeID: "channel", TargetURL: typeKernel.URL},
+	)
+
+	body := `{"rewrite_type":"ADD","type_id":"channel","node_urn":"urn:moos:channel:messaging.wa-sam"}`
+	req := httptest.NewRequest(http.MethodPost, "/rewrites", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if typeHits != 1 {
+		t.Fatalf("type kernel hits = %d, want 1", typeHits)
+	}
+	if shardHits != 0 {
+		t.Fatalf("shard kernel hits = %d, want 0 (type routing should take precedence)", shardHits)
+	}
+}
+
+func TestServeHTTP_TypeRouting_FallbackToShard(t *testing.T) {
+	var shardHits int
+	var mu sync.Mutex
+	shardKernel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		shardHits++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"routed":"by-shard"}`))
+	}))
+	defer shardKernel.Close()
+
+	router := NewRouter(
+		[]ShardRule{{URNPrefix: "urn:moos:", TargetURL: shardKernel.URL}},
+		TypeRule{TypeID: "channel", TargetURL: "http://127.0.0.1:19999"}, // wrong type, won't match
+	)
+
+	// type_id is "session" — no type rule matches, falls back to shard
+	body := `{"rewrite_type":"ADD","type_id":"session","node_urn":"urn:moos:session:sam.t166"}`
+	req := httptest.NewRequest(http.MethodPost, "/rewrites", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if shardHits != 1 {
+		t.Fatalf("shard kernel hits = %d, want 1", shardHits)
+	}
+}
