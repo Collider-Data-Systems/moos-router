@@ -24,40 +24,68 @@ type ShardRule struct {
 	Priority  int    // higher wins on prefix overlap
 }
 
+// TypeRule maps a node type_id to a target kernel base URL.
+// Type routing is checked before URN-prefix routing.
+// Useful for routing by ontology stratum or functional specialisation
+// (e.g. all prg_task nodes → Z440, all session nodes → hp-laptop).
+type TypeRule struct {
+	TypeID    string
+	TargetURL string
+	Priority  int // higher wins when multiple rules match the same type_id
+}
+
 // Router holds the shard table and routes requests.
 type Router struct {
 	Rules         []ShardRule
+	TypeRules     []TypeRule
 	Peers         []string // peer router URLs for federation cascade (WF16)
 	kernels       []string
 	client        *http.Client
 	HealthTimeout time.Duration
 }
 
-// NewRouter creates a Router from a list of rules.
-func NewRouter(rules []ShardRule) *Router {
-	copied := make([]ShardRule, len(rules))
-	copy(copied, rules)
+// NewRouter creates a Router from shard rules and optional type rules.
+// typeRules is variadic so existing callers with only shard rules compile unchanged.
+func NewRouter(rules []ShardRule, typeRules ...TypeRule) *Router {
+	copiedShards := make([]ShardRule, len(rules))
+	copy(copiedShards, rules)
 
-	for i := range copied {
-		copied[i].URNPrefix = strings.TrimSpace(copied[i].URNPrefix)
-		copied[i].TargetURL = strings.TrimRight(strings.TrimSpace(copied[i].TargetURL), "/")
+	for i := range copiedShards {
+		copiedShards[i].URNPrefix = strings.TrimSpace(copiedShards[i].URNPrefix)
+		copiedShards[i].TargetURL = strings.TrimRight(strings.TrimSpace(copiedShards[i].TargetURL), "/")
 	}
 
-	sort.SliceStable(copied, func(i, j int) bool {
-		li := len(copied[i].URNPrefix)
-		lj := len(copied[j].URNPrefix)
+	sort.SliceStable(copiedShards, func(i, j int) bool {
+		li := len(copiedShards[i].URNPrefix)
+		lj := len(copiedShards[j].URNPrefix)
 		if li != lj {
 			return li > lj
 		}
-		if copied[i].Priority != copied[j].Priority {
-			return copied[i].Priority > copied[j].Priority
+		if copiedShards[i].Priority != copiedShards[j].Priority {
+			return copiedShards[i].Priority > copiedShards[j].Priority
 		}
-		return copied[i].URNPrefix < copied[j].URNPrefix
+		return copiedShards[i].URNPrefix < copiedShards[j].URNPrefix
+	})
+
+	copiedTypes := make([]TypeRule, len(typeRules))
+	copy(copiedTypes, typeRules)
+
+	for i := range copiedTypes {
+		copiedTypes[i].TypeID = strings.TrimSpace(copiedTypes[i].TypeID)
+		copiedTypes[i].TargetURL = strings.TrimRight(strings.TrimSpace(copiedTypes[i].TargetURL), "/")
+	}
+
+	sort.SliceStable(copiedTypes, func(i, j int) bool {
+		if copiedTypes[i].TypeID != copiedTypes[j].TypeID {
+			return copiedTypes[i].TypeID < copiedTypes[j].TypeID
+		}
+		return copiedTypes[i].Priority > copiedTypes[j].Priority
 	})
 
 	return &Router{
-		Rules:         copied,
-		kernels:       uniqueKernelURLs(copied),
+		Rules:         copiedShards,
+		TypeRules:     copiedTypes,
+		kernels:       uniqueKernelURLs(copiedShards, copiedTypes),
 		client:        &http.Client{},
 		HealthTimeout: defaultHealthTimeout,
 	}
@@ -74,8 +102,19 @@ func (r *Router) Route(urn string) string {
 	return ""
 }
 
+// RouteByType returns the target base URL for the given type_id, or "" if no rule matches.
+// Type routing is checked before URN-prefix routing in handleRoutedPost.
+func (r *Router) RouteByType(typeID string) string {
+	for _, rule := range r.TypeRules {
+		if rule.TypeID == typeID {
+			return rule.TargetURL
+		}
+	}
+	return ""
+}
+
 // ServeHTTP implements http.Handler.
-// - POST /rewrites and POST /programs: extract URN from JSON body, route to correct kernel, proxy the request
+// - POST /rewrites and POST /programs: type routing first, then URN-prefix routing
 // - GET /state/nodes/{urn}: extract URN from path, route, proxy
 // - All other paths: broadcast to all kernels (fan-out), merge responses
 // - GET /healthz: return router health + list of kernel health statuses
@@ -105,19 +144,30 @@ func (r *Router) handleRoutedPost(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	urn, err := extractURNFromBody(body)
+	urn, typeID, err := extractBodyFields(body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	if urn == "" {
-		writeError(w, http.StatusUnprocessableEntity, "no URN found in request body")
-		return
+
+	// Type routing takes precedence over URN-prefix routing.
+	target := ""
+	if typeID != "" {
+		target = r.RouteByType(typeID)
 	}
 
-	target := r.Route(urn)
+	// Fall back to URN-prefix routing.
 	if target == "" {
-		writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("no shard rule matches URN %s", urn))
+		if urn == "" {
+			writeError(w, http.StatusUnprocessableEntity, "no URN found in request body")
+			return
+		}
+		target = r.Route(urn)
+	}
+
+	if target == "" {
+		writeError(w, http.StatusUnprocessableEntity,
+			fmt.Sprintf("no shard or type rule matches (urn=%s type_id=%s)", urn, typeID))
 		return
 	}
 
@@ -398,12 +448,16 @@ func (r *Router) healthTimeout() time.Duration {
 	return r.HealthTimeout
 }
 
-func extractURNFromBody(body []byte) (string, error) {
+// extractBodyFields extracts the primary URN and type_id from a rewrite envelope
+// or the first envelope in a program batch.
+func extractBodyFields(body []byte) (urn, typeID string, err error) {
 	var payload any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", err
+	if err = json.Unmarshal(body, &payload); err != nil {
+		return
 	}
-	return findURN(payload), nil
+	urn = findURN(payload)
+	typeID = findTypeID(payload)
+	return
 }
 
 func findURN(payload any) string {
@@ -432,20 +486,45 @@ func findURN(payload any) string {
 	return ""
 }
 
-func uniqueKernelURLs(rules []ShardRule) []string {
-	seen := make(map[string]struct{}, len(rules))
-	urls := make([]string, 0, len(rules))
+func findTypeID(payload any) string {
+	switch v := payload.(type) {
+	case map[string]any:
+		if t, ok := v["type_id"]; ok {
+			if s, ok := t.(string); ok && strings.TrimSpace(s) != "" {
+				return strings.TrimSpace(s)
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if t := findTypeID(item); t != "" {
+				return t
+			}
+		}
+	}
+	return ""
+}
 
-	for _, rule := range rules {
-		u := strings.TrimRight(strings.TrimSpace(rule.TargetURL), "/")
+func uniqueKernelURLs(shardRules []ShardRule, typeRules []TypeRule) []string {
+	seen := make(map[string]struct{})
+	urls := make([]string, 0)
+
+	add := func(u string) {
+		u = strings.TrimRight(strings.TrimSpace(u), "/")
 		if u == "" {
-			continue
+			return
 		}
 		if _, exists := seen[u]; exists {
-			continue
+			return
 		}
 		seen[u] = struct{}{}
 		urls = append(urls, u)
+	}
+
+	for _, rule := range shardRules {
+		add(rule.TargetURL)
+	}
+	for _, rule := range typeRules {
+		add(rule.TargetURL)
 	}
 
 	sort.Strings(urls)
