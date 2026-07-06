@@ -6,11 +6,13 @@ on:
   issues:
     types: [opened, reopened, closed]
 
+# Minimal read-only token permissions: Projects v2 writes go through
+# PROJECTS_TOKEN; the classic repository-projects grant is useless for v2
+# and only widens blast radius (Copilot review, moos-kernel#43).
 permissions:
   contents: read
   pull-requests: read
   issues: read
-  repository-projects: write
 
 jobs:
   sync-project-item:
@@ -88,7 +90,9 @@ jobs:
             const statusField  = project.fields.nodes.find(f => f.name === process.env.STATUS_FIELD_NAME);
             const statusOption = statusField?.options?.find(o => o.name === statusName);
             if (!statusField || !statusOption) {
-              core.setFailed(`Status field/option not found: ${statusName}`);
+              // Non-blocking by design: a renamed/missing board field must
+              // never fail repository checks.
+              core.warning(`Status field/option not found: ${statusName}. Skipping project sync.`);
               return;
             }
 
@@ -103,6 +107,15 @@ jobs:
                 }`, { pid: project.id, cid: nodeId });
               itemId = add.addProjectV2ItemById.item.id;
             } catch(e) {
+              // addProjectV2ItemById is idempotent (re-add returns the
+              // existing item), so an error here is almost always real
+              // (permissions, rate limit). Only fall back to the full scan
+              // when the message suggests the item already exists; anything
+              // else warns + skips instead of paginating the whole project.
+              if (!/already exists|content already/i.test(e.message || '')) {
+                core.warning(`addProjectV2ItemById failed: ${e.message}. Skipping project sync.`);
+                return;
+              }
               let cursor = null;
               outer: while (true) {
                 const page = await github.graphql(`
