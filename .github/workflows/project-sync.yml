@@ -2,24 +2,159 @@ name: Project Sync
 
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review, closed]
+    types: [opened, reopened, ready_for_review, synchronize, closed]
   issues:
     types: [opened, reopened, closed]
 
+# Minimal read-only token permissions: Projects v2 writes go through
+# PROJECTS_TOKEN; the classic repository-projects grant is useless for v2
+# and only widens blast radius (Copilot review, moos-kernel#43).
 permissions:
   contents: read
   pull-requests: read
   issues: read
-  repository-projects: write
 
 jobs:
-  sync:
-    uses: MSD21091969/moos-config/.github/workflows/project-sync-reusable.yml@master
-    with:
-      event_name: ${{ github.event_name }}
-      action: ${{ github.event.action }}
-      content_node_id: ${{ github.event.pull_request.node_id || github.event.issue.node_id }}
-      is_pr: ${{ github.event_name == 'pull_request' }}
-      is_merged: ${{ github.event.pull_request.merged || false }}
-    permissions:
-      repository-projects: write
+  sync-project-item:
+    runs-on: ubuntu-latest
+    env:
+      # T=247 takeover: org board #4 is the live board (see dev/reference/github-org-operations.md).
+      # github.token cannot write org Projects v2 — PROJECTS_TOKEN (PAT with project scope) is required;
+      # the script warns + skips if the token lacks access, so repo checks stay non-blocking.
+      PROJECT_OWNER: Collider-Data-Systems
+      PROJECT_NUMBER: "4"
+      STATUS_FIELD_NAME: Status
+      STATUS_TODO: Todo
+      STATUS_IN_PROGRESS: In Progress
+      STATUS_DONE: Done
+    steps:
+      - name: Sync item with project board
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.PROJECTS_TOKEN || github.token }}
+          script: |
+            const owner      = process.env.PROJECT_OWNER;
+            const projectNum = Number(process.env.PROJECT_NUMBER);
+            const action     = '${{ github.event.action }}';
+            const isPR       = '${{ github.event_name }}' === 'pull_request';
+            const merged     = ${{ github.event.pull_request.merged || false }};
+            const nodeId     = '${{ github.event.pull_request.node_id || github.event.issue.node_id }}';
+
+            const statusName = action === 'closed'
+              ? (isPR && merged ? process.env.STATUS_DONE : process.env.STATUS_TODO)
+              : process.env.STATUS_IN_PROGRESS;
+
+            // Resolve project (user first, then organization fallback).
+            let project = null;
+            try {
+              const userRes = await github.graphql(`
+                query($owner: String!, $num: Int!) {
+                  user(login: $owner) {
+                    projectV2(number: $num) {
+                      id
+                      fields(first: 50) {
+                        nodes {
+                          ... on ProjectV2SingleSelectField { id name options { id name } }
+                        }
+                      }
+                    }
+                  }
+                }`, { owner, num: projectNum });
+              project = userRes?.user?.projectV2 ?? null;
+            } catch (_) { /* try org fallback */ }
+
+            if (!project) {
+              try {
+                const orgRes = await github.graphql(`
+                  query($owner: String!, $num: Int!) {
+                    organization(login: $owner) {
+                      projectV2(number: $num) {
+                        id
+                        fields(first: 50) {
+                          nodes {
+                            ... on ProjectV2SingleSelectField { id name options { id name } }
+                          }
+                        }
+                      }
+                    }
+                  }`, { owner, num: projectNum });
+                project = orgRes?.organization?.projectV2 ?? null;
+              } catch (_) { /* no-op */ }
+            }
+
+            if (!project) {
+              core.warning(`Project ${owner}#${projectNum} not accessible. Skipping sync.`);
+              return;
+            }
+
+            const statusField  = project.fields.nodes.find(f => f.name === process.env.STATUS_FIELD_NAME);
+            const statusOption = statusField?.options?.find(o => o.name === statusName);
+            if (!statusField || !statusOption) {
+              // Non-blocking by design: a renamed/missing board field must
+              // never fail repository checks.
+              core.warning(`Status field/option not found: ${statusName}. Skipping project sync.`);
+              return;
+            }
+
+            // Add item (or find existing)
+            let itemId;
+            try {
+              const add = await github.graphql(`
+                mutation($pid: ID!, $cid: ID!) {
+                  addProjectV2ItemById(input: {projectId: $pid, contentId: $cid}) {
+                    item { id }
+                  }
+                }`, { pid: project.id, cid: nodeId });
+              itemId = add.addProjectV2ItemById.item.id;
+            } catch(e) {
+              // addProjectV2ItemById is idempotent (re-add returns the
+              // existing item), so an error here is almost always real
+              // (permissions, rate limit). Only fall back to the full scan
+              // when the message suggests the item already exists; anything
+              // else warns + skips instead of paginating the whole project.
+              if (!/already exists|content already/i.test(e.message || '')) {
+                core.warning(`addProjectV2ItemById failed: ${e.message}. Skipping project sync.`);
+                return;
+              }
+              let cursor = null;
+              outer: while (true) {
+                const page = await github.graphql(`
+                  query($pid: ID!, $cursor: String) {
+                    node(id: $pid) {
+                      ... on ProjectV2 {
+                        items(first: 100, after: $cursor) {
+                          nodes { id content { ... on Issue { id } ... on PullRequest { id } } }
+                          pageInfo { hasNextPage endCursor }
+                        }
+                      }
+                    }
+                  }`, { pid: project.id, cursor });
+                for (const i of page.node.items.nodes) {
+                  if (i.content?.id === nodeId) { itemId = i.id; break outer; }
+                }
+                if (!page.node.items.pageInfo.hasNextPage) break;
+                cursor = page.node.items.pageInfo.endCursor;
+              }
+            }
+
+            if (!itemId) {
+              core.warning('Could not find or create project item. Skipping project sync so repository checks remain non-blocking.');
+              return;
+            }
+
+            try {
+              await github.graphql(`
+                mutation($pid: ID!, $iid: ID!, $fid: ID!, $oid: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $pid, itemId: $iid, fieldId: $fid,
+                    value: { singleSelectOptionId: $oid }
+                  }) { projectV2Item { id } }
+                }`, { pid: project.id, iid: itemId, fid: statusField.id, oid: statusOption.id });
+            } catch (e) {
+              core.warning(`Could not update project item status. Skipping project sync: ${e.message}`);
+              return;
+            }
+
+            core.info(`Synced to project: status=${statusName}`);
+
+
