@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -35,66 +36,83 @@ type TypeRule struct {
 }
 
 // Router holds the shard table and routes requests.
+// The topology (Rules, TypeRules, Peers, kernels) is accessed via an atomic
+// pointer so it can be swapped at runtime without restarting the process.
 type Router struct {
-	Rules         []ShardRule
-	TypeRules     []TypeRule
-	Peers         []string // peer router URLs for federation cascade (WF16)
-	kernels       []string
+	topology      *TopologyHolder
 	client        *http.Client
 	HealthTimeout time.Duration
+
+	// TopologyFile is the path to the topology JSON file used by Reload().
+	// Empty means reload is disabled.
+	TopologyFile string
+	// LocalHost is the hostname key for this workstation in the topology file.
+	LocalHost string
+
+	// Deprecated direct fields kept only for NewRouter backward compat.
+	Rules     []ShardRule
+	TypeRules []TypeRule
+	Peers     []string
+	kernels   []string
+}
+
+// table returns the current topology snapshot (lock-free read).
+func (r *Router) table() *TopologyTable {
+	return r.topology.Load()
 }
 
 // NewRouter creates a Router from shard rules and optional type rules.
 // typeRules is variadic so existing callers with only shard rules compile unchanged.
 func NewRouter(rules []ShardRule, typeRules ...TypeRule) *Router {
-	copiedShards := make([]ShardRule, len(rules))
-	copy(copiedShards, rules)
-
-	for i := range copiedShards {
-		copiedShards[i].URNPrefix = strings.TrimSpace(copiedShards[i].URNPrefix)
-		copiedShards[i].TargetURL = strings.TrimRight(strings.TrimSpace(copiedShards[i].TargetURL), "/")
-	}
-
-	sort.SliceStable(copiedShards, func(i, j int) bool {
-		li := len(copiedShards[i].URNPrefix)
-		lj := len(copiedShards[j].URNPrefix)
-		if li != lj {
-			return li > lj
-		}
-		if copiedShards[i].Priority != copiedShards[j].Priority {
-			return copiedShards[i].Priority > copiedShards[j].Priority
-		}
-		return copiedShards[i].URNPrefix < copiedShards[j].URNPrefix
-	})
-
-	copiedTypes := make([]TypeRule, len(typeRules))
-	copy(copiedTypes, typeRules)
-
-	for i := range copiedTypes {
-		copiedTypes[i].TypeID = strings.TrimSpace(copiedTypes[i].TypeID)
-		copiedTypes[i].TargetURL = strings.TrimRight(strings.TrimSpace(copiedTypes[i].TargetURL), "/")
-	}
-
-	sort.SliceStable(copiedTypes, func(i, j int) bool {
-		if copiedTypes[i].TypeID != copiedTypes[j].TypeID {
-			return copiedTypes[i].TypeID < copiedTypes[j].TypeID
-		}
-		return copiedTypes[i].Priority > copiedTypes[j].Priority
-	})
-
+	tbl := buildTable(rules, typeRules, nil)
 	return &Router{
-		Rules:         copiedShards,
-		TypeRules:     copiedTypes,
-		kernels:       uniqueKernelURLs(copiedShards, copiedTypes),
+		topology:      NewTopologyHolder(tbl),
+		Rules:         tbl.Rules,
+		TypeRules:     tbl.TypeRules,
+		Peers:         tbl.Peers,
+		kernels:       tbl.Kernels,
 		client:        &http.Client{},
 		HealthTimeout: defaultHealthTimeout,
 	}
 }
 
+// SetPeers updates the peer list on the current topology table.
+// Called after NewRouter when peers are parsed separately from shard rules.
+func (r *Router) SetPeers(peers []string) {
+	old := r.table()
+	newTbl := buildTable(old.Rules, old.TypeRules, peers)
+	r.topology.Store(newTbl)
+	// Keep deprecated fields in sync for any code that reads them directly.
+	r.Peers = newTbl.Peers
+	r.kernels = newTbl.Kernels
+}
+
+// Reload reads the topology file and atomically swaps the routing table.
+// Returns the number of shard rules + peers in the new table, or an error.
+func (r *Router) Reload() (int, error) {
+	if r.TopologyFile == "" {
+		return 0, fmt.Errorf("no topology file configured")
+	}
+	tf, err := LoadTopologyFile(r.TopologyFile)
+	if err != nil {
+		return 0, err
+	}
+	old := r.table()
+	newTbl := BuildTableFromFile(tf, r.LocalHost, old.TypeRules)
+	r.topology.Store(newTbl)
+	// Keep deprecated fields in sync.
+	r.Rules = newTbl.Rules
+	r.TypeRules = newTbl.TypeRules
+	r.Peers = newTbl.Peers
+	r.kernels = newTbl.Kernels
+	return len(newTbl.Rules) + len(newTbl.Peers), nil
+}
+
 // Route returns the target base URL for the given URN, or "" if no rule matches.
 // Longest-prefix match wins; ties broken by Priority (desc).
 func (r *Router) Route(urn string) string {
-	for _, rule := range r.Rules {
+	tbl := r.table()
+	for _, rule := range tbl.Rules {
 		if strings.HasPrefix(urn, rule.URNPrefix) {
 			return rule.TargetURL
 		}
@@ -105,7 +123,8 @@ func (r *Router) Route(urn string) string {
 // RouteByType returns the target base URL for the given type_id, or "" if no rule matches.
 // Type routing is checked before URN-prefix routing in handleRoutedPost.
 func (r *Router) RouteByType(typeID string) string {
-	for _, rule := range r.TypeRules {
+	tbl := r.table()
+	for _, rule := range tbl.TypeRules {
 		if rule.TypeID == typeID {
 			return rule.TargetURL
 		}
@@ -114,11 +133,17 @@ func (r *Router) RouteByType(typeID string) string {
 }
 
 // ServeHTTP implements http.Handler.
+// - POST /admin/topology/reload: localhost-guarded hot-reload of topology file
 // - POST /rewrites and POST /programs: type routing first, then URN-prefix routing
 // - GET /state/nodes/{urn}: extract URN from path, route, proxy
 // - All other paths: broadcast to all kernels (fan-out), merge responses
 // - GET /healthz: return router health + list of kernel health statuses
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method == http.MethodPost && req.URL.Path == "/admin/topology/reload" {
+		r.handleAdminReload(w, req)
+		return
+	}
+
 	if req.Method == http.MethodGet && req.URL.Path == "/healthz" {
 		r.handleHealthz(w, req)
 		return
@@ -199,7 +224,7 @@ func (r *Router) handleRoutedNodeRequest(w http.ResponseWriter, req *http.Reques
 	}
 
 	// Cascade to peer routers (WF16 federation read path)
-	for _, peerURL := range r.Peers {
+	for _, peerURL := range r.table().Peers {
 		resp, body, err := r.tryForward(req, peerURL)
 		if err != nil {
 			log.Printf("proxy: peer cascade skip %s: %v", peerURL, err)
@@ -265,7 +290,8 @@ func (r *Router) forwardSingle(w http.ResponseWriter, req *http.Request, targetB
 }
 
 func (r *Router) handleFanout(w http.ResponseWriter, req *http.Request) {
-	if len(r.kernels) == 0 {
+	tbl := r.table()
+	if len(tbl.Kernels) == 0 {
 		writeError(w, http.StatusServiceUnavailable, "no kernels configured")
 		return
 	}
@@ -282,10 +308,10 @@ func (r *Router) handleFanout(w http.ResponseWriter, req *http.Request) {
 		err  error
 	}
 
-	results := make(chan fanoutResult, len(r.kernels))
+	results := make(chan fanoutResult, len(tbl.Kernels))
 	var wg sync.WaitGroup
 
-	for _, kernelURL := range r.kernels {
+	for _, kernelURL := range tbl.Kernels {
 		kernelURL := kernelURL
 		wg.Add(1)
 		go func() {
@@ -370,7 +396,32 @@ func (r *Router) handleFanout(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, http.StatusOK, merged)
 }
 
+func (r *Router) handleAdminReload(w http.ResponseWriter, req *http.Request) {
+	// Localhost guard: only allow reload from loopback.
+	host := req.Host
+	if h, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
+		host = h
+	}
+	if host != "127.0.0.1" && host != "::1" && host != "localhost" {
+		writeError(w, http.StatusForbidden, "admin endpoints are localhost-only")
+		return
+	}
+
+	count, err := r.Reload()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "reload failed: "+err.Error())
+		return
+	}
+	log.Printf("admin: topology reloaded from %s (%d rules+peers)", r.TopologyFile, count)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "reloaded",
+		"file":    r.TopologyFile,
+		"entries": count,
+	})
+}
+
 func (r *Router) handleHealthz(w http.ResponseWriter, req *http.Request) {
+	tbl := r.table()
 	type upstreamHealth struct {
 		Status string `json:"status"`
 		LogLen int    `json:"log_len"`
@@ -383,10 +434,10 @@ func (r *Router) handleHealthz(w http.ResponseWriter, req *http.Request) {
 		Error  string `json:"error,omitempty"`
 	}
 
-	kernels := make([]kernelStatus, len(r.kernels))
+	kernels := make([]kernelStatus, len(tbl.Kernels))
 	var wg sync.WaitGroup
 
-	for i, kernelURL := range r.kernels {
+	for i, kernelURL := range tbl.Kernels {
 		i, kernelURL := i, kernelURL
 		wg.Add(1)
 		go func() {

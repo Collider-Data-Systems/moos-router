@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -30,6 +31,8 @@ func main() {
 	listenAddr := flag.String("listen", ":9000", "router listen address")
 	defaultKernel := flag.String("default", "", "fallback kernel URL when no prefix matches")
 	healthTimeout := flag.Duration("health-timeout", 2*time.Second, "timeout for per-kernel health checks")
+	topologyFile := flag.String("topology-file", "", "path to moos-federation.topology.json for hot-reload (enables POST /admin/topology/reload)")
+	localHost := flag.String("local-host", "", "local hostname key in topology file (e.g. hp-laptop, hp-z440); auto-detected from MOOS_LOCAL_HOST env if unset")
 
 	var shardValues multiFlag
 	var typeMapValues multiFlag
@@ -95,6 +98,20 @@ func main() {
 		if trimmed != "" {
 			router.Peers = append(router.Peers, trimmed)
 		}
+	}
+	if len(router.Peers) > 0 {
+		router.SetPeers(router.Peers)
+	}
+
+	// Topology hot-reload configuration
+	resolvedHost := strings.TrimSpace(*localHost)
+	if resolvedHost == "" {
+		resolvedHost = strings.TrimSpace(os.Getenv("MOOS_LOCAL_HOST"))
+	}
+	if *topologyFile != "" {
+		router.TopologyFile = *topologyFile
+		router.LocalHost = resolvedHost
+		log.Printf("router: topology hot-reload enabled (file=%s, local-host=%s)", *topologyFile, resolvedHost)
 	}
 
 	log.Printf("router: listening on %s, shards: %d, type-maps: %d, peers: %d",
