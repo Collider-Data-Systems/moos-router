@@ -5,9 +5,17 @@ name: governance-sentinel
 # branch. A failed scheduled run also emails the owner, so the check failing
 # is itself a signal.
 #
-# NOT covered here (GitHub Free + this repo token has no admin:org): org
-# member-change and audit-log alerting — those need an org-level webhook or the
-# audit-log API (GitHub Team/Enterprise) or a PAT with admin:org. See
+# IMPORTANT — token: reading `repos/<r>/rulesets` needs the repository
+# "Administration: read" permission, which is NOT grantable to the default
+# GITHUB_TOKEN (no `administration` key exists in a workflow `permissions:`
+# block). So set a repo/org secret **GOVERNANCE_READ_TOKEN** = a fine-grained
+# PAT with Administration:read on this repo; the step below prefers it and
+# falls back to GITHUB_TOKEN. WITHOUT that secret the ruleset read 403s and the
+# check SAFE-NO-OPS (logs a note, opens no issue) — it never false-alarms.
+#
+# NOT covered here (GitHub Free + no admin:org): org member-change and
+# audit-log alerting — those need an org webhook / audit-log API (Team/
+# Enterprise) or a PAT with admin:org. See
 # dev/reference/github-org-operations.md §Q6 for the documented remainder.
 
 on:
@@ -17,7 +25,6 @@ on:
 
 permissions:
   contents: read
-  administration: read
   issues: write
 
 jobs:
@@ -26,7 +33,7 @@ jobs:
     steps:
       - name: Verify default-branch protection ruleset is active
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GOVERNANCE_READ_TOKEN || github.token }}
           REPO: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
@@ -34,8 +41,9 @@ jobs:
           echo "Checking rulesets on $REPO (default branch: $DEFAULT_BRANCH)"
 
           # Fail SAFE/QUIET on a token-permission problem: warn, do not alarm.
+          # (Expected when GOVERNANCE_READ_TOKEN is unset — GITHUB_TOKEN 403s.)
           if ! rulesets=$(gh api "repos/$REPO/rulesets" 2>/tmp/err); then
-            echo "::warning::Could not read rulesets (token permissions?). Skipping check."
+            echo "::warning::Could not read rulesets (needs GOVERNANCE_READ_TOKEN with Administration:read). Skipping check — no alarm raised."
             cat /tmp/err || true
             exit 0
           fi
