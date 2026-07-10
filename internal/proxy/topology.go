@@ -110,9 +110,13 @@ type TopologyKernel struct {
 }
 
 // TopologyRouter is a router entry in the topology file.
+// DefaultKernel and ShardAliases reference kernel entries by map key, so URL
+// selection (http_local vs http_tailscale) stays in one place.
 type TopologyRouter struct {
-	Host  string   `json:"host"`
-	Peers []string `json:"peers"`
+	Host          string            `json:"host"`
+	Peers         []string          `json:"peers"`
+	DefaultKernel string            `json:"default_kernel"`
+	ShardAliases  map[string]string `json:"shard_aliases"`
 }
 
 // LoadTopologyFile reads and parses a topology JSON file.
@@ -128,19 +132,33 @@ func LoadTopologyFile(path string) (*TopologyFile, error) {
 	return &tf, nil
 }
 
+// kernelTargetURL picks the URL a router on localHost should use to reach a
+// kernel: http_local for same-host kernels, http_tailscale for remote ones.
+func kernelTargetURL(kernel TopologyKernel, localHost string) string {
+	target := kernel.HTTPLocal
+	if kernel.Host != localHost && kernel.HTTPTailscale != "" {
+		target = kernel.HTTPTailscale
+	}
+	return target
+}
+
 // BuildTableFromFile builds a TopologyTable from a topology file for the given
 // local hostname. It derives shard rules from kernel entries (non-local kernels
-// get their Tailscale URL as the shard target) and peers from the router entry
-// matching localHost.
-func BuildTableFromFile(tf *TopologyFile, localHost string, existingTypeRules []TypeRule) *TopologyTable {
+// get their Tailscale URL as the shard target); the router entry matching
+// localHost contributes peers, the default rule (empty prefix, priority -1 —
+// same shape as the --default flag), and extra shard-alias prefixes such as
+// urn:moos:ws:<host>. A table with zero shard rules is refused so a bad file
+// can never hot-swap a working router into one that 503s everything.
+func BuildTableFromFile(tf *TopologyFile, localHost string, existingTypeRules []TypeRule) (*TopologyTable, error) {
+	if len(tf.Kernels) == 0 {
+		return nil, fmt.Errorf("topology file has no kernels — refusing empty routing table")
+	}
+
 	var shardRules []ShardRule
 	var peers []string
 
 	for name, kernel := range tf.Kernels {
-		target := kernel.HTTPLocal
-		if kernel.Host != localHost && kernel.HTTPTailscale != "" {
-			target = kernel.HTTPTailscale
-		}
+		target := kernelTargetURL(kernel, localHost)
 		if target == "" {
 			continue
 		}
@@ -151,18 +169,56 @@ func BuildTableFromFile(tf *TopologyFile, localHost string, existingTypeRules []
 		})
 	}
 
+	if len(shardRules) == 0 {
+		return nil, fmt.Errorf("topology file yields no reachable kernel for local-host %q — refusing empty routing table", localHost)
+	}
+
 	// Sort shards deterministically for reproducible /healthz output
 	sort.Slice(shardRules, func(i, j int) bool {
 		return shardRules[i].URNPrefix < shardRules[j].URNPrefix
 	})
 
-	// Find the router entry for this host
+	// The router entry for this host contributes peers, the default rule and
+	// alias shards.
 	for _, router := range tf.Routers {
-		if router.Host == localHost {
-			peers = router.Peers
-			break
+		if router.Host != localHost {
+			continue
 		}
+		peers = router.Peers
+
+		if router.DefaultKernel != "" {
+			kernel, ok := tf.Kernels[router.DefaultKernel]
+			if !ok {
+				return nil, fmt.Errorf("default_kernel %q not found in kernels map", router.DefaultKernel)
+			}
+			target := kernelTargetURL(kernel, localHost)
+			if target == "" {
+				return nil, fmt.Errorf("default_kernel %q has no usable URL for local-host %q", router.DefaultKernel, localHost)
+			}
+			shardRules = append(shardRules, ShardRule{
+				URNPrefix: "",
+				TargetURL: target,
+				Priority:  -1,
+			})
+		}
+
+		for prefix, kernelName := range router.ShardAliases {
+			kernel, ok := tf.Kernels[kernelName]
+			if !ok {
+				return nil, fmt.Errorf("shard_alias %q -> %q not found in kernels map", prefix, kernelName)
+			}
+			target := kernelTargetURL(kernel, localHost)
+			if target == "" {
+				return nil, fmt.Errorf("shard_alias %q -> %q has no usable URL for local-host %q", prefix, kernelName, localHost)
+			}
+			shardRules = append(shardRules, ShardRule{
+				URNPrefix: prefix,
+				TargetURL: target,
+				Priority:  0,
+			})
+		}
+		break
 	}
 
-	return buildTable(shardRules, existingTypeRules, peers)
+	return buildTable(shardRules, existingTypeRules, peers), nil
 }
