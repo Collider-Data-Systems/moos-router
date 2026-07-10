@@ -137,6 +137,33 @@ func TestReload_PreservesDefaultAndAliases(t *testing.T) {
 	}
 }
 
+func TestReload_SkipsRemoteKernelWithoutTailscale(t *testing.T) {
+	// A remote kernel with no http_tailscale is unreachable from this box —
+	// it must be skipped, never routed via its http_local (the wrong box).
+	topoPath := writeTopology(t, `{
+		"kernels": {
+			"hp-z440.primary": {"host": "hp-z440", "http_local": "http://localhost:8000"},
+			"hp-laptop.primary": {"host": "hp-laptop", "http_local": "http://localhost:8000"}
+		},
+		"routers": {}
+	}`)
+
+	router := NewRouter([]ShardRule{})
+	router.TopologyFile = topoPath
+	router.LocalHost = "hp-z440"
+
+	if _, err := router.Reload(); err != nil {
+		t.Fatalf("Reload() error = %v", err)
+	}
+
+	if got := router.Route("urn:moos:kernel:hp-z440.primary"); got != "http://localhost:8000" {
+		t.Fatalf("Route(local kernel) = %q, want http://localhost:8000", got)
+	}
+	if got := router.Route("urn:moos:kernel:hp-laptop.primary"); got != "" {
+		t.Fatalf("Route(remote kernel without tailscale) = %q, want \"\" (skipped)", got)
+	}
+}
+
 func TestReload_RejectsEmptyFile(t *testing.T) {
 	topoPath := writeTopology(t, `{}`)
 

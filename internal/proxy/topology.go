@@ -134,12 +134,13 @@ func LoadTopologyFile(path string) (*TopologyFile, error) {
 
 // kernelTargetURL picks the URL a router on localHost should use to reach a
 // kernel: http_local for same-host kernels, http_tailscale for remote ones.
+// A remote kernel without a Tailscale URL yields "" (unreachable from here) —
+// falling back to http_local would silently route to the WRONG box's kernel.
 func kernelTargetURL(kernel TopologyKernel, localHost string) string {
-	target := kernel.HTTPLocal
-	if kernel.Host != localHost && kernel.HTTPTailscale != "" {
-		target = kernel.HTTPTailscale
+	if kernel.Host == localHost {
+		return kernel.HTTPLocal
 	}
-	return target
+	return kernel.HTTPTailscale
 }
 
 // BuildTableFromFile builds a TopologyTable from a topology file for the given

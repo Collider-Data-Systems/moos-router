@@ -406,13 +406,16 @@ func (r *Router) handleFanout(w http.ResponseWriter, req *http.Request) {
 }
 
 // isLoopback reports whether the request originated from the local machine.
-// Admin endpoints are localhost-only.
+// Admin endpoints are localhost-only. The check is based solely on the actual
+// remote network address — never the client-controlled Host header — and
+// fails closed on anything unparseable.
 func isLoopback(req *http.Request) bool {
-	host := req.Host
-	if h, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
-		host = h
+	host, _, err := net.SplitHostPort(req.RemoteAddr)
+	if err != nil {
+		return false
 	}
-	return host == "127.0.0.1" || host == "::1" || host == "localhost"
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (r *Router) handleAdminReload(w http.ResponseWriter, req *http.Request) {
