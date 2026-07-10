@@ -33,12 +33,9 @@ internal/proxy   — shard map, peer cascade, request routing
 ```bash
 go run ./cmd/router \
   --listen :9000 \
-  --shard urn:moos:ws:hp-z440=http://localhost:8000 \
-  --shard urn:moos:kernel:hp-z440.menno=http://localhost:8001 \
-  --shard urn:moos:kernel:hp-z440.lola=http://localhost:8002 \
-  --shard urn:moos:kernel:hp-z440.moos=http://localhost:8003 \
   --default http://localhost:8000 \
-  --peer http://192.168.1.18:9000
+  --topology-file ../ffs0/dev/config/moos-federation.topology.json \
+  --local-host hp-z440
 ```
 
 ### CLI Flags
@@ -46,9 +43,14 @@ go run ./cmd/router \
 | Flag | Purpose |
 |------|---------|
 | `--listen` | HTTP listen address (typically `:9000`) |
-| `--shard` | Repeatable: `<urn-prefix>=<kernel-url>`. Routes read/write by URN match. |
-| `--default` | Fallback kernel URL for URNs matching no shard |
-| `--peer` | Repeatable: peer router URL for WF16 cross-workstation cascade |
+| `--topology-file` | Topology JSON (SOT): loaded at boot, hot-reloadable via `POST /admin/topology/reload`; introspect via `GET /admin/topology` (both localhost-only) |
+| `--local-host` | Hostname key in the topology file; required with `--topology-file` (env fallback `MOOS_LOCAL_HOST`) |
+| `--shard` | Repeatable: `<urn-prefix>=<kernel-url>`. Bootstrap fallback if the file fails to load. |
+| `--default` | Fallback kernel URL for URNs matching no shard. Bootstrap fallback if the file fails to load. |
+| `--peer` | Repeatable: peer router URL for WF16 cross-workstation cascade. Replaced by the file's peers on load. |
+| `--type-map` | Repeatable: `<type_id>=<kernel-url>`, checked before shard rules; survives reloads. |
+
+Full topology-file key reference: `README.md` §Topology configuration.
 
 ---
 

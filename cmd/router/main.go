@@ -103,15 +103,30 @@ func main() {
 		router.SetPeers(router.Peers)
 	}
 
-	// Topology hot-reload configuration
+	// Topology file configuration: the file is loaded at boot and becomes the
+	// routing table; CLI --shard/--default flags act as a bootstrap fallback
+	// when the file fails to load (e.g. mid-edit). POST /admin/topology/reload
+	// re-reads the same file at runtime.
 	resolvedHost := strings.TrimSpace(*localHost)
 	if resolvedHost == "" {
 		resolvedHost = strings.TrimSpace(os.Getenv("MOOS_LOCAL_HOST"))
 	}
 	if *topologyFile != "" {
+		if resolvedHost == "" {
+			// An empty local-host silently routes this machine's own kernels
+			// via their Tailscale URLs (hairpin) — fail loud instead.
+			log.Fatalf("router: --topology-file requires --local-host or MOOS_LOCAL_HOST")
+		}
 		router.TopologyFile = *topologyFile
 		router.LocalHost = resolvedHost
-		log.Printf("router: topology hot-reload enabled (file=%s, local-host=%s)", *topologyFile, resolvedHost)
+		if count, err := router.Reload(); err != nil {
+			if len(shardRules) == 0 {
+				log.Fatalf("router: boot topology load failed with no --shard/--default fallback: %v", err)
+			}
+			log.Printf("router: WARNING boot topology load failed, serving CLI flag table (%d rules): %v", len(shardRules), err)
+		} else {
+			log.Printf("router: topology loaded from %s at boot (%d rules+peers, local-host=%s)", *topologyFile, count, resolvedHost)
+		}
 	}
 
 	log.Printf("router: listening on %s, shards: %d, type-maps: %d, peers: %d",

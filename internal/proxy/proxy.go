@@ -98,7 +98,10 @@ func (r *Router) Reload() (int, error) {
 		return 0, err
 	}
 	old := r.table()
-	newTbl := BuildTableFromFile(tf, r.LocalHost, old.TypeRules)
+	newTbl, err := BuildTableFromFile(tf, r.LocalHost, old.TypeRules)
+	if err != nil {
+		return 0, err
+	}
 	r.topology.Store(newTbl)
 	// Keep deprecated fields in sync.
 	r.Rules = newTbl.Rules
@@ -134,6 +137,7 @@ func (r *Router) RouteByType(typeID string) string {
 
 // ServeHTTP implements http.Handler.
 // - POST /admin/topology/reload: localhost-guarded hot-reload of topology file
+// - GET /admin/topology: localhost-guarded dump of the live routing table
 // - POST /rewrites and POST /programs: type routing first, then URN-prefix routing
 // - GET /state/nodes/{urn}: extract URN from path, route, proxy
 // - All other paths: broadcast to all kernels (fan-out), merge responses
@@ -141,6 +145,11 @@ func (r *Router) RouteByType(typeID string) string {
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost && req.URL.Path == "/admin/topology/reload" {
 		r.handleAdminReload(w, req)
+		return
+	}
+
+	if req.Method == http.MethodGet && req.URL.Path == "/admin/topology" {
+		r.handleAdminTopology(w, req)
 		return
 	}
 
@@ -396,13 +405,21 @@ func (r *Router) handleFanout(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, http.StatusOK, merged)
 }
 
-func (r *Router) handleAdminReload(w http.ResponseWriter, req *http.Request) {
-	// Localhost guard: only allow reload from loopback.
-	host := req.Host
-	if h, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
-		host = h
+// isLoopback reports whether the request originated from the local machine.
+// Admin endpoints are localhost-only. The check is based solely on the actual
+// remote network address — never the client-controlled Host header — and
+// fails closed on anything unparseable.
+func isLoopback(req *http.Request) bool {
+	host, _, err := net.SplitHostPort(req.RemoteAddr)
+	if err != nil {
+		return false
 	}
-	if host != "127.0.0.1" && host != "::1" && host != "localhost" {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func (r *Router) handleAdminReload(w http.ResponseWriter, req *http.Request) {
+	if !isLoopback(req) {
 		writeError(w, http.StatusForbidden, "admin endpoints are localhost-only")
 		return
 	}
@@ -417,6 +434,46 @@ func (r *Router) handleAdminReload(w http.ResponseWriter, req *http.Request) {
 		"status":  "reloaded",
 		"file":    r.TopologyFile,
 		"entries": count,
+	})
+}
+
+// handleAdminTopology dumps the live routing table so operators can diff the
+// running state against the topology file without restarting the router.
+func (r *Router) handleAdminTopology(w http.ResponseWriter, req *http.Request) {
+	if !isLoopback(req) {
+		writeError(w, http.StatusForbidden, "admin endpoints are localhost-only")
+		return
+	}
+
+	tbl := r.table()
+
+	type shardEntry struct {
+		URNPrefix string `json:"urn_prefix"`
+		TargetURL string `json:"target_url"`
+		Priority  int    `json:"priority"`
+	}
+	type typeEntry struct {
+		TypeID    string `json:"type_id"`
+		TargetURL string `json:"target_url"`
+		Priority  int    `json:"priority"`
+	}
+
+	rules := make([]shardEntry, len(tbl.Rules))
+	for i, rule := range tbl.Rules {
+		rules[i] = shardEntry{URNPrefix: rule.URNPrefix, TargetURL: rule.TargetURL, Priority: rule.Priority}
+	}
+	typeRules := make([]typeEntry, len(tbl.TypeRules))
+	for i, rule := range tbl.TypeRules {
+		typeRules[i] = typeEntry{TypeID: rule.TypeID, TargetURL: rule.TargetURL, Priority: rule.Priority}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"rules":      rules,
+		"type_rules": typeRules,
+		"peers":      tbl.Peers,
+		"kernels":    tbl.Kernels,
+		"file":       r.TopologyFile,
+		"local_host": r.LocalHost,
 	})
 }
 
