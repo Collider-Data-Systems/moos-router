@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -114,6 +115,11 @@ func TestServeHTTP_FanOut_StateNodes(t *testing.T) {
 	paths := map[string]string{}
 
 	kernelA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","kernel_urn":"urn:moos:kernel:test.alpha"}`))
+			return
+		}
 		mu.Lock()
 		paths["A"] = r.URL.Path
 		mu.Unlock()
@@ -123,6 +129,11 @@ func TestServeHTTP_FanOut_StateNodes(t *testing.T) {
 	defer kernelA.Close()
 
 	kernelB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","kernel_urn":"urn:moos:kernel:test.beta"}`))
+			return
+		}
 		mu.Lock()
 		paths["B"] = r.URL.Path
 		mu.Unlock()
@@ -452,5 +463,171 @@ func TestServeHTTP_TypeRouting_FallbackToShard(t *testing.T) {
 	defer mu.Unlock()
 	if shardHits != 1 {
 		t.Fatalf("shard kernel hits = %d, want 1", shardHits)
+	}
+}
+
+// syntheticKernel serves a hand-authored payload on every non-healthz path and
+// self-identifies with the given URN on /healthz. All fixtures in these tests
+// are synthetic — no URN or log entry is derived from any sovereign log.
+func syntheticKernel(t *testing.T, kernelURN, payload string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/healthz" {
+			_, _ = w.Write([]byte(`{"status":"ok","log_len":2,"kernel_urn":"` + kernelURN + `"}`))
+			return
+		}
+		_, _ = w.Write([]byte(payload))
+	}))
+}
+
+func TestServeHTTP_FanOut_LogStampedWithKernelURN(t *testing.T) {
+	// Both kernels number their logs 1..2 — the repeated-log_seq ambiguity.
+	// The stamp must make (kernel_urn, log_seq) a unique citation.
+	kernelA := syntheticKernel(t, "urn:moos:kernel:test.alpha", `[{"log_seq":1,"envelope":{}},{"log_seq":2,"envelope":{}}]`)
+	defer kernelA.Close()
+	kernelB := syntheticKernel(t, "urn:moos:kernel:test.beta", `[{"log_seq":1,"envelope":{}},{"log_seq":2,"envelope":{}}]`)
+	defer kernelB.Close()
+
+	router := NewRouter([]ShardRule{
+		{URNPrefix: "urn:moos:ws:test-a", TargetURL: kernelA.URL, Priority: 0},
+		{URNPrefix: "urn:moos:ws:test-b", TargetURL: kernelB.URL, Priority: 0},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/log", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+
+	var entries []struct {
+		LogSeq    int    `json:"log_seq"`
+		KernelURN string `json:"kernel_urn"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&entries); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if len(entries) != 4 {
+		t.Fatalf("merged entries = %d, want 4", len(entries))
+	}
+
+	citations := map[string]int{}
+	for _, entry := range entries {
+		if entry.KernelURN != "urn:moos:kernel:test.alpha" && entry.KernelURN != "urn:moos:kernel:test.beta" {
+			t.Fatalf("entry kernel_urn = %q, want a probed synthetic kernel URN", entry.KernelURN)
+		}
+		citations[fmt.Sprintf("%s#%d", entry.KernelURN, entry.LogSeq)]++
+	}
+	if len(citations) != 4 {
+		t.Fatalf("distinct (kernel_urn, log_seq) citations = %d, want 4 (got %+v)", len(citations), citations)
+	}
+}
+
+func TestServeHTTP_FanOut_ProbeFailureLeavesRecordsUnstamped(t *testing.T) {
+	// Attribution comes only from the engine's own self-identification — a
+	// failed probe must yield an unstamped record, never a guessed URN.
+	kernel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"log_seq":1}]`))
+	}))
+	defer kernel.Close()
+
+	router := NewRouter([]ShardRule{{URNPrefix: "urn:moos:ws:test-a", TargetURL: kernel.URL, Priority: 0}})
+
+	req := httptest.NewRequest(http.MethodGet, "/log", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+
+	var entries []map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&entries); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("merged entries = %d, want 1", len(entries))
+	}
+	if _, stamped := entries[0]["kernel_urn"]; stamped {
+		t.Fatalf("entry = %+v, want no kernel_urn stamp after probe failure", entries[0])
+	}
+}
+
+func TestServeHTTP_FanOut_ExistingKernelURNNotOverwritten(t *testing.T) {
+	kernel := syntheticKernel(t, "urn:moos:kernel:test.probe", `[{"log_seq":1,"kernel_urn":"urn:moos:kernel:test.selfstamped"}]`)
+	defer kernel.Close()
+
+	router := NewRouter([]ShardRule{{URNPrefix: "urn:moos:ws:test-a", TargetURL: kernel.URL, Priority: 0}})
+
+	req := httptest.NewRequest(http.MethodGet, "/log", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	var entries []struct {
+		KernelURN string `json:"kernel_urn"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&entries); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if len(entries) != 1 || entries[0].KernelURN != "urn:moos:kernel:test.selfstamped" {
+		t.Fatalf("entries = %+v, want engine-provided kernel_urn preserved", entries)
+	}
+}
+
+func TestServeHTTP_FanOut_NonObjectPayloadUnchanged(t *testing.T) {
+	kernel := syntheticKernel(t, "urn:moos:kernel:test.alpha", `["scalar-a","scalar-b"]`)
+	defer kernel.Close()
+
+	router := NewRouter([]ShardRule{{URNPrefix: "urn:moos:ws:test-a", TargetURL: kernel.URL, Priority: 0}})
+
+	req := httptest.NewRequest(http.MethodGet, "/log", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	var merged []any
+	if err := json.NewDecoder(rr.Body).Decode(&merged); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if len(merged) != 2 || merged[0] != "scalar-a" || merged[1] != "scalar-b" {
+		t.Fatalf("merged = %+v, want scalar payload passed through unchanged", merged)
+	}
+}
+
+func TestServeHTTP_Healthz_ReportsKernelURN(t *testing.T) {
+	kernel := syntheticKernel(t, "urn:moos:kernel:test.alpha", `[]`)
+	defer kernel.Close()
+
+	router := NewRouter([]ShardRule{{URNPrefix: "urn:moos:ws:test-a", TargetURL: kernel.URL, Priority: 0}})
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+
+	var response struct {
+		Kernels []struct {
+			URL       string `json:"url"`
+			Status    string `json:"status"`
+			KernelURN string `json:"kernel_urn"`
+		} `json:"kernels"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&response); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if len(response.Kernels) != 1 {
+		t.Fatalf("kernels length = %d, want 1", len(response.Kernels))
+	}
+	if response.Kernels[0].KernelURN != "urn:moos:kernel:test.alpha" {
+		t.Fatalf("kernel_urn = %q, want the engine's self-reported URN", response.Kernels[0].KernelURN)
 	}
 }

@@ -1,0 +1,31 @@
+name: go-ci
+
+# t280: minimal build/vet/test gate on the federation router. Before this, no
+# workflow ran at all in this repo — the "verified green" line on router PRs
+# was a manual assertion. Mirrors moos-kernel's go-ci so the required-check
+# name (build-vet-test) is uniform across the G9 main-merge-gate rulesets.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build-vet-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: build
+        run: go build ./...
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test ./...
