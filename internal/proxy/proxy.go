@@ -312,9 +312,10 @@ func (r *Router) handleFanout(w http.ResponseWriter, req *http.Request) {
 	}
 
 	type fanoutResult struct {
-		url  string
-		body []byte
-		err  error
+		url       string
+		body      []byte
+		kernelURN string
+		err       error
 	}
 
 	results := make(chan fanoutResult, len(tbl.Kernels))
@@ -355,7 +356,7 @@ func (r *Router) handleFanout(w http.ResponseWriter, req *http.Request) {
 				return
 			}
 
-			results <- fanoutResult{url: kernelURL, body: respBody}
+			results <- fanoutResult{url: kernelURL, body: respBody, kernelURN: r.kernelURN(req.Context(), kernelURL)}
 		}()
 	}
 
@@ -385,6 +386,7 @@ func (r *Router) handleFanout(w http.ResponseWriter, req *http.Request) {
 			continue
 		}
 
+		stampKernelURN(decoded, result.kernelURN)
 		switch payload := decoded.(type) {
 		case []any:
 			merged = append(merged, payload...)
@@ -403,6 +405,64 @@ func (r *Router) handleFanout(w http.ResponseWriter, req *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, merged)
+}
+
+// kernelURN asks a kernel to self-identify via the kernel_urn property on its
+// own /healthz. Attribution is only ever taken from the engine itself — never
+// inferred from the target URL — so any probe failure returns "" and the
+// caller leaves records unstamped rather than guessing. Probed per request,
+// no cache: the router stays stateless and a kernel restart that changes the
+// engine behind a URL can never be mis-attributed from stale state.
+func (r *Router) kernelURN(ctx context.Context, kernelURL string) string {
+	probeCtx, cancel := context.WithTimeout(ctx, r.healthTimeout())
+	defer cancel()
+
+	probeReq, err := http.NewRequestWithContext(probeCtx, http.MethodGet, joinURL(kernelURL, "/healthz", ""), nil)
+	if err != nil {
+		return ""
+	}
+
+	resp, err := r.client.Do(probeReq)
+	if err != nil {
+		log.Printf("proxy: kernel_urn probe failed for %s: %v", kernelURL, err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("proxy: kernel_urn probe for %s: status %d", kernelURL, resp.StatusCode)
+		return ""
+	}
+
+	var health struct {
+		KernelURN string `json:"kernel_urn"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		log.Printf("proxy: kernel_urn probe for %s: invalid JSON: %v", kernelURL, err)
+		return ""
+	}
+	return strings.TrimSpace(health.KernelURN)
+}
+
+// stampKernelURN annotates fan-in records with the URN self-reported by their
+// source engine, making the citation form kernel_urn + log_seq computable
+// from merged output. Only JSON objects can carry the stamp; scalars pass
+// through unchanged, and a record that already carries kernel_urn keeps the
+// engine-provided value.
+func stampKernelURN(decoded any, kernelURN string) {
+	if kernelURN == "" {
+		return
+	}
+	switch payload := decoded.(type) {
+	case map[string]any:
+		if _, exists := payload["kernel_urn"]; !exists {
+			payload["kernel_urn"] = kernelURN
+		}
+	case []any:
+		for _, item := range payload {
+			stampKernelURN(item, kernelURN)
+		}
+	}
 }
 
 // isLoopback reports whether the request originated from the local machine.
@@ -480,15 +540,17 @@ func (r *Router) handleAdminTopology(w http.ResponseWriter, req *http.Request) {
 func (r *Router) handleHealthz(w http.ResponseWriter, req *http.Request) {
 	tbl := r.table()
 	type upstreamHealth struct {
-		Status string `json:"status"`
-		LogLen int    `json:"log_len"`
+		Status    string `json:"status"`
+		LogLen    int    `json:"log_len"`
+		KernelURN string `json:"kernel_urn"`
 	}
 
 	type kernelStatus struct {
-		URL    string `json:"url"`
-		Status string `json:"status"`
-		LogLen int    `json:"log_len,omitempty"`
-		Error  string `json:"error,omitempty"`
+		URL       string `json:"url"`
+		Status    string `json:"status"`
+		KernelURN string `json:"kernel_urn,omitempty"`
+		LogLen    int    `json:"log_len,omitempty"`
+		Error     string `json:"error,omitempty"`
 	}
 
 	kernels := make([]kernelStatus, len(tbl.Kernels))
@@ -534,6 +596,7 @@ func (r *Router) handleHealthz(w http.ResponseWriter, req *http.Request) {
 
 			entry.Status = health.Status
 			entry.LogLen = health.LogLen
+			entry.KernelURN = strings.TrimSpace(health.KernelURN)
 			kernels[i] = entry
 		}()
 	}
