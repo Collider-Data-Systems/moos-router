@@ -356,7 +356,9 @@ func (r *Router) handleFanout(w http.ResponseWriter, req *http.Request) {
 				return
 			}
 
-			results <- fanoutResult{url: kernelURL, body: respBody, kernelURN: r.kernelURN(req.Context(), kernelURL)}
+			// The probe rides subCtx so payload + probe together stay inside
+			// the per-kernel fan-out budget.
+			results <- fanoutResult{url: kernelURL, body: respBody, kernelURN: r.kernelURN(subCtx, kernelURL)}
 		}()
 	}
 
