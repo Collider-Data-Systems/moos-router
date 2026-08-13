@@ -1,3 +1,6 @@
 moos-router.exe
 *.exe~
 *.exe.bak*
+
+# Redeploy-leg output (untracked runtime residue)
+router-redeploy-result.txt
